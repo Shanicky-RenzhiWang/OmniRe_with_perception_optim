@@ -27,14 +27,19 @@ logger = logging.getLogger()
 class HMR2Predictor(HMR2018Predictor):
     def __init__(self, cfg) -> None:
         super().__init__(cfg)
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         # Setup our new model
         from third_party.Humans4D.hmr2.models import download_models, load_hmr2
 
         # Download and load checkpoints
         download_models()
         model, _ = load_hmr2()
+        logger.info(f"Loaded HMR2 model from checkpoint.")
 
-        self.model = model
+        # self.model = model
+        self.model = model.to(self.device)
         self.model.eval()
 
     def forward(self, x):
@@ -43,6 +48,7 @@ class HMR2Predictor(HMR2018Predictor):
             'img': x[:,:3,:,:],
             'mask': (x[:,3,:,:]).clip(0,1),
         }
+        batch = batch.to(self.device)
         model_out = self.model(batch)
         out = hmar_out | {
             'pose_smpl': model_out['pred_smpl_params'],
@@ -63,6 +69,7 @@ class HMR2023TextureSampler(HMR2Predictor):
 
         self.img_size = 256         #self.cfg.MODEL.IMAGE_SIZE
         self.focal_length = 5000.   #self.cfg.EXTRA.FOCAL_LENGTH
+        logger.info(f"Using img_size={self.img_size}, focal_length={self.focal_length}")
 
         import neural_renderer as nr
         self.neural_renderer = nr.Renderer(dist_coeffs=None, orig_size=self.img_size,
@@ -108,7 +115,6 @@ class HMR2023TextureSampler(HMR2Predictor):
         focal = self.focal_length / (self.img_size / 2)
         map_verts_proj = focal * map_verts[:, :, :2] / map_verts[:, :, 2:3] # B,N,2
         map_verts_depth = map_verts[:, :, 2] # B,N
-
         # Render Depth. Annoying but we need to create this
         K = torch.eye(3, device=device)
         K[0, 0] = K[1, 1] = self.focal_length
@@ -235,7 +241,8 @@ def run_4DHumans(
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         cfg.video.output_dir = output_dir
-
+        
+        # cfg.render.enable = False
         phalp_tracker = HMR2_4dhuman(cfg)
         phalp_tracker.track()
         

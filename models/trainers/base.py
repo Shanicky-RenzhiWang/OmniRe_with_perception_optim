@@ -7,6 +7,7 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import kornia
 from enum import IntEnum
@@ -80,6 +81,7 @@ class BasicTrainer(nn.Module):
         self._type = type
         self.optim_general = optim
         self.losses_dict = losses
+        print(losses)
         self.render_cfg = render
         self.res_schedule = res_schedule
         self.model_config = model_config
@@ -124,6 +126,7 @@ class BasicTrainer(nn.Module):
         
         # a simple viewer for background visualization
         self.viewer = None
+    
     
     @property
     def in_test_set(self):
@@ -248,6 +251,12 @@ class BasicTrainer(nn.Module):
                 use_inverse_depth=depth_loss_cfg.inverse_depth,
             )
         self.depth_loss_fn = depth_loss_fn
+        
+        if self.losses_dict.get("perception", None) is not None:
+            self.perception_loss_fn = YOLOCIoUPerceptionLoss()
+            
+        if self.losses_dict.get("bbox", None) is not None:
+            self.bbox_loss_fn = BBoxSSIMLoss()
     
     def optimizer_zero_grad(self) -> None:
         self.optimizer.zero_grad()
@@ -611,6 +620,32 @@ class BasicTrainer(nn.Module):
                     loss_dict.update({
                         "vehicle_region_rgb_loss": weight_factor * Ll1,
                     })
+        perception_losses = self.losses_dict.get("perception", None)
+        if perception_losses is not None:
+            rec_image = predicted_rgb
+            gt_image = gt_rgb
+            target_h, target_w = 320, 480
+
+            # [H,W,3] -> [1,3,H,W]
+            rec_image = rec_image.permute(2, 0, 1).unsqueeze(0)
+            gt_image = gt_image.permute(2, 0, 1).unsqueeze(0)
+
+            # resize
+            rec_image = F.interpolate(rec_image, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            gt_image = F.interpolate(gt_image, size=(target_h, target_w), mode='bilinear', align_corners=False)
+
+            perception_loss = self.perception_loss_fn.get_perception_loss(rec_image, gt_image) * perception_losses.get("w", 1.0)
+            loss_dict.update({"perception_loss": perception_loss})
+        
+        bbox_losses = self.losses_dict.get("bbox", None)
+        if bbox_losses is not None:
+            rec_image = predicted_rgb
+            gt_image = gt_rgb
+            rec_image = rec_image.permute(2, 0, 1).unsqueeze(0)
+            gt_image = gt_image.permute(2, 0, 1).unsqueeze(0)
+            
+            bbox_loss = self.bbox_loss_fn.get_bbox_ssim_loss(rec_image, gt_image) * bbox_losses.get("w", 1.0)
+            loss_dict.update({"bbox_loss": bbox_loss})
             
         # compute gaussian reg loss
         for class_name in self.gaussian_classes.keys():
@@ -786,3 +821,163 @@ class BasicTrainer(nn.Module):
             radius_clip=4.0,  # skip GSs that have small image radius (in pixels)
         )
         return render_colors[0].cpu().numpy()
+    
+def denormalize_yolo_bboxes(gt_boxes, H, W):
+    if len(gt_boxes) == 0:
+        return np.zeros((0,4), dtype=np.float32)
+
+    gt_boxes = np.array(gt_boxes, dtype=np.float32)
+    x_center = gt_boxes[:,0] * W
+    y_center = gt_boxes[:,1] * H
+    w = gt_boxes[:,2] * W
+    h = gt_boxes[:,3] * H
+
+    x1 = x_center - w/2
+    y1 = y_center - h/2
+    x2 = x_center + w/2
+    y2 = y_center + h/2
+
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+def _input_gt_bbox(source_path):
+    gt_bboxes_path = Path(source_path).joinpath("bboxes", "labels")
+    gt_bboxes = {}
+    for txt_file in gt_bboxes_path.glob("*.txt"):
+        gt_bboxes[txt_file.stem] = []
+        with open(txt_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    x1, y1, x2, y2 = map(float, parts[1:5])
+                    gt_bboxes[txt_file.stem].append([x1, y1, x2, y2])
+    return gt_bboxes
+
+from ultralytics import YOLO
+
+class YOLOCIoUPerceptionLoss:
+    def __init__(self, source_path, model_path='yolov8s.pt', conf_threshold=0.5, device='cuda', lambda_perception=0.001):
+        self.model = YOLO(model_path)
+        self.conf_threshold = conf_threshold
+        self.device = device
+        self.lambda_perception = lambda_perception
+        self.gt_bboxes = _input_gt_bbox(source_path)
+        
+
+    def _run_model(self, img):
+        img_clamped = torch.clamp(img, 0.0, 1.0)
+        with torch.no_grad():
+            results = self.model(img_clamped, conf=self.conf_threshold, verbose=False)
+        boxes_list, scores_list = [], []
+        for r in results:
+            boxes = r.boxes.xyxy.cpu().numpy()  # [N,4]
+            scores = r.boxes.conf.cpu().numpy()  # [N]
+            mask = scores >= self.conf_threshold
+            boxes_list.append(boxes[mask])
+            scores_list.append(scores[mask])
+        if len(boxes_list) == 0 or boxes_list[0].size == 0:
+            return np.zeros((0,4)), np.zeros((0,))
+        boxes = np.concatenate(boxes_list, axis=0)
+        scores = np.concatenate(scores_list, axis=0)
+        return boxes, scores
+
+    @staticmethod
+    def ciou_loss(pred_boxes, gt_boxes, eps=1e-7):
+        if pred_boxes.shape[0] == 0 or gt_boxes.shape[0] == 0:
+            return torch.tensor(0.0, device='cuda')
+
+        pred = torch.tensor(pred_boxes, dtype=torch.float32, device='cuda')
+        gt = torch.tensor(gt_boxes, dtype=torch.float32, device='cuda')
+
+        pred_w = pred[:,2]-pred[:,0]
+        pred_h = pred[:,3]-pred[:,1]
+        gt_w = gt[:,2]-gt[:,0]
+        gt_h = gt[:,3]-gt[:,1]
+
+        pred_cx = (pred[:,0]+pred[:,2])/2
+        pred_cy = (pred[:,1]+pred[:,3])/2
+        gt_cx = (gt[:,0]+gt[:,2])/2
+        gt_cy = (gt[:,1]+gt[:,3])/2
+
+        inter_x1 = torch.max(pred[:,0], gt[:,0])
+        inter_y1 = torch.max(pred[:,1], gt[:,1])
+        inter_x2 = torch.min(pred[:,2], gt[:,2])
+        inter_y2 = torch.min(pred[:,3], gt[:,3])
+        inter_w = (inter_x2 - inter_x1).clamp(0)
+        inter_h = (inter_y2 - inter_y1).clamp(0)
+        inter_area = inter_w * inter_h
+
+        union_area = pred_w*pred_h + gt_w*gt_h - inter_area
+        iou = inter_area / (union_area + eps)
+
+        c_x1 = torch.min(pred[:,0], gt[:,0])
+        c_y1 = torch.min(pred[:,1], gt[:,1])
+        c_x2 = torch.max(pred[:,2], gt[:,2])
+        c_y2 = torch.max(pred[:,3], gt[:,3])
+        c_diag = (c_x2-c_x1)**2 + (c_y2-c_y1)**2
+
+        rho2 = (pred_cx-gt_cx)**2 + (pred_cy-gt_cy)**2
+
+        v = (4 / (np.pi**2)) * torch.pow(torch.atan(gt_w/(gt_h+eps)) - torch.atan(pred_w/(pred_h+eps)), 2)
+        alpha = v / (1 - iou + v + eps)
+
+        ciou = iou - rho2/(c_diag+eps) - alpha*v
+        return (1 - ciou).mean()
+
+    def get_perception_loss(self, rec_image, frame_name):
+        rec_boxes, rec_scores = self._run_model(rec_image)
+        gt_boxes = self.gt_bboxes.get(frame_name, [])
+        H, W = rec_image.shape[-2:]
+        gt_boxes = denormalize_yolo_bboxes(gt_boxes, H, W)
+
+        max_boxes = min(len(rec_boxes), len(gt_boxes), 10)
+        if max_boxes == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        rec_boxes = rec_boxes[:max_boxes]
+        gt_boxes = gt_boxes[:max_boxes]
+
+        loss = self.ciou_loss(rec_boxes, gt_boxes)
+        return self.lambda_perception * loss
+    
+
+class BBoxSSIMLoss:
+    def __init__(self, source_path, window_size=9, conf_thres=0.5):
+        self.window_size = window_size
+        self.conf_thres = conf_thres
+        self.gt_bboxes = _input_gt_bbox(source_path)
+
+    def get_bbox_ssim_loss(self, re_img, gt_img, frame_name):
+        """
+        re_img, gt_img: (1, C, H, W), range [0,1]
+        return: scalar loss
+        """
+
+
+        gt_boxes = self.gt_bboxes.get(frame_name, [])
+        H, W = re_img.shape[-2:]
+        gt_boxes = denormalize_yolo_bboxes(gt_boxes, H, W)
+
+        # bboxes = []
+        # for r in gt_boxes:
+        #     for box in r.boxes.xyxy:  # [x1, y1, x2, y2]
+        #         bboxes.append(box.tolist())
+
+        if len(gt_boxes) == 0:
+            return (re_img * 0).sum()
+
+        losses = []
+        for bbox in gt_boxes:
+            x1, y1, x2, y2 = map(int, bbox)
+            crop1 = re_img[..., y1:y2, x1:x2]
+            crop2 = gt_img[..., y1:y2, x1:x2]
+
+            if crop2.size(-1) < self.window_size or crop2.size(-2) < self.window_size:
+                continue
+
+            ssim_val = ssim(crop1, crop2, window_size=self.window_size, size_average=True)
+            losses.append(1 - ssim_val)
+
+        if len(losses) == 0:
+            return (re_img * 0).sum()
+
+        return torch.stack(losses).mean()
