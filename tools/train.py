@@ -137,6 +137,7 @@ def main(args):
         logger.info(
             f"Training from scratch, initializing gaussians from dataset, starting at step {trainer.step}"
         )
+    trainer.init_extra_losses()
     
     if args.enable_viewer:
         # a simple viewer for background visualization
@@ -245,7 +246,7 @@ def main(args):
         
         # get data
         train_step_camera_downscale = trainer._get_downscale_factor()
-        image_infos, cam_infos = dataset.train_image_set.next(train_step_camera_downscale)
+        image_infos, cam_infos, frame_name = dataset.train_image_set.next(train_step_camera_downscale)
         for k, v in image_infos.items():
             if isinstance(v, torch.Tensor):
                 image_infos[k] = v.cuda(non_blocking=True)
@@ -256,11 +257,13 @@ def main(args):
         # forward & backward
         outputs = trainer(image_infos, cam_infos)
         trainer.update_visibility_filter()
+        
 
         loss_dict = trainer.compute_losses(
             outputs=outputs,
             image_infos=image_infos,
             cam_infos=cam_infos,
+            frame_name=frame_name
         )
         # check nan or inf
         for k, v in loss_dict.items():

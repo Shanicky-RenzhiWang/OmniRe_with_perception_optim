@@ -16,6 +16,7 @@ import nerfview
 from pytorch_msssim import SSIM
 from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from pathlib import Path
 
 from models.gaussians.basics import *
 
@@ -81,7 +82,6 @@ class BasicTrainer(nn.Module):
         self._type = type
         self.optim_general = optim
         self.losses_dict = losses
-        print(losses)
         self.render_cfg = render
         self.res_schedule = res_schedule
         self.model_config = model_config
@@ -252,11 +252,14 @@ class BasicTrainer(nn.Module):
             )
         self.depth_loss_fn = depth_loss_fn
         
+    def init_extra_losses(self):
         if self.losses_dict.get("perception", None) is not None:
-            self.perception_loss_fn = YOLOCIoUPerceptionLoss()
+            assert self.data_path is not None, "data_path is required for perception loss"
+            self.perception_loss_fn = YOLOCIoUPerceptionLoss(self.data_path)
             
         if self.losses_dict.get("bbox", None) is not None:
-            self.bbox_loss_fn = BBoxSSIMLoss()
+            assert self.data_path is not None, "data_path is required for bbox loss"
+            self.bbox_loss_fn = BBoxSSIMLoss(self.data_path)
     
     def optimizer_zero_grad(self) -> None:
         self.optimizer.zero_grad()
@@ -528,7 +531,8 @@ class BasicTrainer(nn.Module):
         self,
         outputs: Dict[str, torch.Tensor],
         image_infos: Dict[str, torch.Tensor],
-        cam_infos: Dict[str, torch.Tensor]
+        cam_infos: Dict[str, torch.Tensor],
+        frame_name = None
     ) -> Dict[str, torch.Tensor]:
         # calculate loss
         loss_dict = {}
@@ -634,7 +638,7 @@ class BasicTrainer(nn.Module):
             rec_image = F.interpolate(rec_image, size=(target_h, target_w), mode='bilinear', align_corners=False)
             gt_image = F.interpolate(gt_image, size=(target_h, target_w), mode='bilinear', align_corners=False)
 
-            perception_loss = self.perception_loss_fn.get_perception_loss(rec_image, gt_image) * perception_losses.get("w", 1.0)
+            perception_loss = self.perception_loss_fn.get_perception_loss(rec_image,frame_name) * perception_losses.get("w", 1.0)
             loss_dict.update({"perception_loss": perception_loss})
         
         bbox_losses = self.losses_dict.get("bbox", None)
@@ -644,7 +648,7 @@ class BasicTrainer(nn.Module):
             rec_image = rec_image.permute(2, 0, 1).unsqueeze(0)
             gt_image = gt_image.permute(2, 0, 1).unsqueeze(0)
             
-            bbox_loss = self.bbox_loss_fn.get_bbox_ssim_loss(rec_image, gt_image) * bbox_losses.get("w", 1.0)
+            bbox_loss = self.bbox_loss_fn.get_bbox_ssim_loss(rec_image, gt_image, frame_name) * bbox_losses.get("w", 1.0)
             loss_dict.update({"bbox_loss": bbox_loss})
             
         # compute gaussian reg loss
@@ -929,6 +933,7 @@ class YOLOCIoUPerceptionLoss:
         H, W = rec_image.shape[-2:]
         gt_boxes = denormalize_yolo_bboxes(gt_boxes, H, W)
 
+
         max_boxes = min(len(rec_boxes), len(gt_boxes), 10)
         if max_boxes == 0:
             return torch.tensor(0.0, device=self.device)
@@ -938,13 +943,14 @@ class YOLOCIoUPerceptionLoss:
 
         loss = self.ciou_loss(rec_boxes, gt_boxes)
         return self.lambda_perception * loss
-    
+
 
 class BBoxSSIMLoss:
     def __init__(self, source_path, window_size=9, conf_thres=0.5):
         self.window_size = window_size
         self.conf_thres = conf_thres
         self.gt_bboxes = _input_gt_bbox(source_path)
+        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3, window_size=7).to(self.device)
 
     def get_bbox_ssim_loss(self, re_img, gt_img, frame_name):
         """
@@ -956,11 +962,6 @@ class BBoxSSIMLoss:
         gt_boxes = self.gt_bboxes.get(frame_name, [])
         H, W = re_img.shape[-2:]
         gt_boxes = denormalize_yolo_bboxes(gt_boxes, H, W)
-
-        # bboxes = []
-        # for r in gt_boxes:
-        #     for box in r.boxes.xyxy:  # [x1, y1, x2, y2]
-        #         bboxes.append(box.tolist())
 
         if len(gt_boxes) == 0:
             return (re_img * 0).sum()
@@ -974,7 +975,7 @@ class BBoxSSIMLoss:
             if crop2.size(-1) < self.window_size or crop2.size(-2) < self.window_size:
                 continue
 
-            ssim_val = ssim(crop1, crop2, window_size=self.window_size, size_average=True)
+            ssim_val = self.ssim(crop1.permute(2, 0, 1)[None, ...], crop2.permute(2, 0, 1)[None, ...], window_size=self.window_size, size_average=True)
             losses.append(1 - ssim_val)
 
         if len(losses) == 0:

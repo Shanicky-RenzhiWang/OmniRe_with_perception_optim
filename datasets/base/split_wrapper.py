@@ -38,7 +38,11 @@ class SplitWrapper(torch.utils.data.Dataset):
         image_infos, cam_infos = self.datasource.get_image(img_idx)
         self.datasource.reset_downscale_factor()
         
-        return image_infos, cam_infos
+        img_timestep = img_idx // self.datasource.num_cams
+        img_cam = img_idx % self.datasource.num_cams
+        frame_name = f"{img_timestep:03d}_{img_cam}"
+        
+        return image_infos, cam_infos, frame_name
     
     def __getitem__(self, idx) -> dict:
         return self.get_image(idx, camera_downscale=1.0)
