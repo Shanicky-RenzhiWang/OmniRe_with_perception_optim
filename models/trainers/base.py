@@ -950,7 +950,7 @@ class BBoxSSIMLoss:
         self.window_size = window_size
         self.conf_thres = conf_thres
         self.gt_bboxes = _input_gt_bbox(source_path)
-        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3, window_size=7).to(self.device)
+        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3, win_size=7).to(self.device)
 
     def get_bbox_ssim_loss(self, re_img, gt_img, frame_name):
         """
