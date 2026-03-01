@@ -53,13 +53,13 @@ trainer:
       lr: 0.001
   gaussian_ctrl_general_cfg:
     warmup_steps: 500             # warmup steps for alpha
-    reset_alpha_interval: 3000    # reset alpha every n steps
+    reset_alpha_interval: 2000    # reset alpha every n steps
     refine_interval: 100          # refine gaussians every n steps
     sh_degree_interval: 1000      # every n intervals turn on another sh degree
     n_split_samples: 2            # number of samples to split gaussians into
     # may differ in different models
     reset_alpha_value: 0.01       # reset alpha to this value
-    densify_grad_thresh: 0.0005   # above this grad, gaussians are densified
+    densify_grad_thresh: 0.0003   # above this grad, gaussians are densified
     densify_size_thresh: 0.003    # below this size, gaussians are *duplicated*, otherwise split
     cull_alpha_thresh: 0.005      # threshold of opacity for culling gaussians
     cull_scale_thresh: 0.5        # threshold of scale for culling gaussians
